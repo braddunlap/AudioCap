@@ -8,16 +8,17 @@ final class ProcessTap {
 
     typealias InvalidationHandler = (ProcessTap) -> Void
 
-    let process: AudioProcess
+    let process: AudioProcess?
     let muteWhenRunning: Bool
     private let logger: Logger
 
     private(set) var errorMessage: String? = nil
 
-    init(process: AudioProcess, muteWhenRunning: Bool = false) {
+    init(process: AudioProcess?, muteWhenRunning: Bool = false) {
         self.process = process
         self.muteWhenRunning = muteWhenRunning
-        self.logger = Logger(subsystem: kAppSubsystem, category: "\(String(describing: ProcessTap.self))(\(process.name))")
+        let tapName = process?.name ?? "SystemAudioOutput"
+        self.logger = Logger(subsystem: kAppSubsystem, category: "\(String(describing: ProcessTap.self))(\(tapName))")
     }
 
     @ObservationIgnored
@@ -34,17 +35,20 @@ final class ProcessTap {
     @ObservationIgnored
     private(set) var activated = false
 
+    var displayName: String {
+        process?.name ?? "System Audio Output"
+    }
+
     @MainActor
     func activate() {
         guard !activated else { return }
         activated = true
 
         logger.debug(#function)
-
         self.errorMessage = nil
 
         do {
-            try prepare(for: process.objectID)
+            try prepare(forProcessObjectID: self.process?.objectID)
         } catch {
             logger.error("\(error, privacy: .public)")
             self.errorMessage = error.localizedDescription
@@ -86,22 +90,29 @@ final class ProcessTap {
         }
     }
 
-    private func prepare(for objectID: AudioObjectID) throws {
+    private func prepare(forProcessObjectID processObjectID: AudioObjectID?) throws {
         errorMessage = nil
 
-        let tapDescription = CATapDescription(stereoMixdownOfProcesses: [objectID])
+        let tapDescription: CATapDescription
+        if let objectID = processObjectID {
+            tapDescription = CATapDescription(stereoMixdownOfProcesses: [objectID])
+            logger.debug("Configuring tap for process objectID: \(objectID)")
+        } else {
+            tapDescription = CATapDescription(stereoMixdownOfProcesses: [])
+            logger.debug("Configuring tap for system audio output (all processes).")
+        }
+        
         tapDescription.uuid = UUID()
         tapDescription.muteBehavior = muteWhenRunning ? .mutedWhenTapped : .unmuted
         var tapID: AUAudioObjectID = .unknown
         var err = AudioHardwareCreateProcessTap(tapDescription, &tapID)
 
         guard err == noErr else {
-            errorMessage = "Process tap creation failed with error \(err)"
-            return
+            errorMessage = "Process/System tap creation failed with error \(err)"
+            throw errorMessage ?? "Unknown error creating tap."
         }
 
-        logger.debug("Created process tap #\(tapID, privacy: .public)")
-
+        logger.debug("Created process/system tap #\(tapID, privacy: .public)")
         self.processTapID = tapID
 
         let systemOutputID = try AudioDeviceID.readDefaultSystemOutputDevice()
@@ -110,18 +121,16 @@ final class ProcessTap {
 
         let aggregateUID = UUID().uuidString
 
+        let aggregateDeviceName = processObjectID != nil ? "Tap-\(self.displayName)" : "Tap-SystemOutput"
+
         let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "Tap-\(process.id)",
+            kAudioAggregateDeviceNameKey: aggregateDeviceName,
             kAudioAggregateDeviceUIDKey: aggregateUID,
             kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [
-                [
-                    kAudioSubDeviceUIDKey: outputUID
-                ]
-            ],
+            kAudioAggregateDeviceSubDeviceListKey: [ [kAudioSubDeviceUIDKey: outputUID] ],
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapDriftCompensationKey: true,
@@ -146,9 +155,7 @@ final class ProcessTap {
         assert(self.invalidationHandler == nil, "\(#function) called with tap already active!")
 
         errorMessage = nil
-
         logger.debug("Run tap!")
-
         self.invalidationHandler = invalidationHandler
 
         var err = AudioDeviceCreateIOProcIDWithBlock(&deviceProcID, aggregateDeviceID, queue, ioBlock)
@@ -166,7 +173,9 @@ final class ProcessTap {
 final class ProcessTapRecorder {
 
     let fileURL: URL
-    let process: AudioProcess
+    let tapDisplayName: String
+    let icon: NSImage
+
     private let queue = DispatchQueue(label: "ProcessTapRecorder", qos: .userInitiated)
     private let logger: Logger
 
@@ -176,15 +185,21 @@ final class ProcessTapRecorder {
     private(set) var isRecording = false
 
     init(fileURL: URL, tap: ProcessTap) {
-        self.process = tap.process
+        self.tapDisplayName = tap.displayName
         self.fileURL = fileURL
         self._tap = tap
         self.logger = Logger(subsystem: kAppSubsystem, category: "\(String(describing: ProcessTapRecorder.self))(\(fileURL.lastPathComponent))")
+        
+        if let process = tap.process {
+            self.icon = process.icon
+        } else {
+            self.icon = NSWorkspace.shared.icon(for: .applicationBundle)
+        }
     }
 
     private var tap: ProcessTap {
         get throws {
-            guard let _tap else { throw "Process tab unavailable" }
+            guard let _tap else { throw "Process tap unavailable" }
             return _tap
         }
     }
@@ -203,7 +218,13 @@ final class ProcessTapRecorder {
 
         let tap = try tap
 
-        if !tap.activated { tap.activate() }
+        if !tap.activated {
+            tap.activate()
+            if let errorMessage = tap.errorMessage {
+                throw errorMessage
+            }
+        }
+
 
         guard var streamDescription = tap.tapStreamDescription else {
             throw "Tap stream description not available."
@@ -220,8 +241,9 @@ final class ProcessTapRecorder {
             AVSampleRateKey: format.sampleRate,
             AVNumberOfChannelsKey: format.channelCount
         ]
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+        
         let file = try AVAudioFile(forWriting: fileURL, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: format.isInterleaved)
-
         self.currentFile = file
 
         try tap.run(on: queue) { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
@@ -230,39 +252,48 @@ final class ProcessTapRecorder {
                 guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData, deallocator: nil) else {
                     throw "Failed to create PCM buffer"
                 }
-
                 try currentFile.write(from: buffer)
             } catch {
-                logger.error("\(error, privacy: .public)")
+                self.logger.error("Buffer write error: \(error, privacy: .public)")
             }
         } invalidationHandler: { [weak self] tap in
             guard let self else { return }
-            handleInvalidation()
+            DispatchQueue.main.async {
+                self.handleInvalidation()
+            }
         }
-
         isRecording = true
     }
 
+    @MainActor
     func stop() {
-        do {
-            logger.debug(#function)
-
-            guard isRecording else { return }
-
-            currentFile = nil
-
-            isRecording = false
-
-            try tap.invalidate()
-        } catch {
-            logger.error("Stop failed: \(error, privacy: .public)")
-        }
-    }
-
-    private func handleInvalidation() {
+        logger.debug(#function)
         guard isRecording else { return }
 
-        logger.debug(#function)
+        // Try to get the tap. If it's nil (e.g., deallocated), log it but proceed to clean up state.
+        guard let tapToInvalidate = try? self.tap else {
+            logger.warning("Tap unavailable during stop. Cleaning up recorder state.")
+            self.currentFile = nil
+            self.isRecording = false
+            return // Exit if tap is not available
+        }
+        
+        // If tap is available, invalidate it. invalidate() itself is not marked throws.
+        tapToInvalidate.invalidate()
+            
+        self.currentFile = nil
+        self.isRecording = false
+        // No do-catch needed here if invalidate() is non-throwing and
+        // the only potential throw was from the tap getter, which is now handled by try?
     }
 
+    @MainActor
+    private func handleInvalidation() {
+        logger.debug("Handling tap invalidation in recorder.")
+        if isRecording {
+            logger.info("Tap invalidated while recording. Stopping recording.")
+            self.currentFile = nil
+            self.isRecording = false
+        }
+    }
 }

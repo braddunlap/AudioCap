@@ -21,7 +21,7 @@ extension AudioObjectID {
 extension AudioObjectID {
     /// Reads the value for `kAudioHardwarePropertyDefaultSystemOutputDevice`.
     static func readDefaultSystemOutputDevice() throws -> AudioDeviceID {
-        try AudioDeviceID.system.readDefaultSystemOutputDevice()
+        try AudioObjectID.system.readDefaultSystemOutputDevice()
     }
 
     static func readProcessList() throws -> [AudioObjectID] {
@@ -30,7 +30,7 @@ extension AudioObjectID {
 
     /// Reads `kAudioHardwarePropertyTranslatePIDToProcessObject` for the specific pid.
     static func translatePIDToProcessObjectID(pid: pid_t) throws -> AudioObjectID {
-        try AudioDeviceID.system.translatePIDToProcessObjectID(pid: pid)
+        try AudioObjectID.system.translatePIDToProcessObjectID(pid: pid)
     }
 
     /// Reads `kAudioHardwarePropertyProcessObjectList`.
@@ -204,5 +204,107 @@ extension AudioObjectPropertyAddress: @retroactive CustomStringConvertible {
     public var description: String {
         let elementDescription = mElement == kAudioObjectPropertyElementMain ? "main" : mElement.fourCharString
         return "\(mSelector.fourCharString)/\(mScope.fourCharString)/\(elementDescription)"
+    }
+}
+
+public struct AudioInputDevice: Identifiable, Hashable {
+    public let id: AudioDeviceID // AudioDeviceID (UInt32) is Hashable and can serve as Identifiable's id.
+    public let uid: String // Unique identifier for the device (persistent across reboots)
+    public let name: String
+
+    public init(id: AudioDeviceID, uid: String, name: String) {
+        self.id = id
+        self.uid = uid
+        self.name = name
+    }
+}
+
+extension AudioObjectID {
+    static func getAllInputDevices() throws -> [AudioInputDevice] {
+        let allDeviceIDs = try AudioObjectID.system.getAllHardwareDevices()
+        var inputDevices: [AudioInputDevice] = []
+
+        for deviceID in allDeviceIDs {
+            do {
+                let inputChannelCount = try deviceID.getTotalInputChannelCount()
+                if inputChannelCount > 0 {
+                    let deviceName = try deviceID.getDeviceName()
+                    let deviceUID = try deviceID.readDeviceUID()
+                    inputDevices.append(AudioInputDevice(id: deviceID, uid: deviceUID, name: deviceName))
+                }
+            } catch {
+                print("CoreAudioUtils: Could not fully query device \(deviceID): \(error)")
+            }
+        }
+        return inputDevices
+    }
+
+    func getAllHardwareDevices() throws -> [AudioDeviceID] {
+        try requireSystemObject()
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(self, &address, 0, nil, &dataSize)
+        guard err == noErr else {
+            throw "CoreAudioUtils: Error reading data size for \(kAudioHardwarePropertyDevices.fourCharString): \(err)"
+        }
+
+        let deviceCount = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        if deviceCount == 0 {
+            return []
+        }
+        var deviceIDs = [AudioDeviceID](repeating: .unknown, count: deviceCount)
+
+        err = AudioObjectGetPropertyData(self, &address, 0, nil, &dataSize, &deviceIDs)
+        guard err == noErr else {
+            throw "CoreAudioUtils: Error reading device array for \(kAudioHardwarePropertyDevices.fourCharString): \(err)"
+        }
+
+        return deviceIDs
+    }
+
+    func getTotalInputChannelCount() throws -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(self, &address, 0, nil, &dataSize)
+
+        if err == kAudioHardwareUnknownPropertyError || dataSize == 0 {
+            return 0
+        }
+        guard err == noErr else {
+            throw "CoreAudioUtils: Error reading data size for input stream configuration on device \(self): \(err)"
+        }
+
+        let bufferListPtr = UnsafeMutableRawPointer.allocate(byteCount: Int(dataSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { bufferListPtr.deallocate() }
+
+        err = AudioObjectGetPropertyData(self, &address, 0, nil, &dataSize, bufferListPtr)
+        guard err == noErr else {
+            throw "CoreAudioUtils: Error reading input stream configuration for device \(self): \(err)"
+        }
+
+        let audioBufferList = bufferListPtr.assumingMemoryBound(to: AudioBufferList.self)
+        var totalInputChannels: UInt32 = 0
+
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        for i in 0..<Int(buffers.count) {
+            totalInputChannels += buffers[i].mNumberChannels
+        }
+
+        return totalInputChannels
+    }
+
+    func getDeviceName() throws -> String {
+        return try readString(kAudioDevicePropertyDeviceNameCFString)
     }
 }

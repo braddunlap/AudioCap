@@ -54,7 +54,6 @@ final class AudioProcessController {
     private(set) var processes = [AudioProcess]() {
         didSet {
             guard processes != oldValue else { return }
-
             processGroups = AudioProcessGroup.groups(with: processes)
         }
     }
@@ -100,7 +99,7 @@ final class AudioProcessController {
             }
 
             self.processes = updatedProcesses
-                .sorted { // Keep processes with audio active always on top
+                .sorted {
                     if $0.name.localizedStandardCompare($1.name) == .orderedAscending {
                         $1.audioActive && !$0.audioActive ? false : true
                     } else {
@@ -164,8 +163,6 @@ private extension AudioProcess {
     }
 }
 
-// MARK: - Grouping
-
 extension AudioProcessGroup {
     static func groups(with processes: [AudioProcess]) -> [AudioProcessGroup] {
         var byKind = [AudioProcess.Kind: AudioProcessGroup]()
@@ -192,8 +189,6 @@ extension AudioProcess.Kind {
         }
     }
 }
-
-// MARK: - Helpers
 
 private func processInfo(for pid: pid_t) -> (name: String, path: String)? {
     let nameBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(MAXPATHLEN))
