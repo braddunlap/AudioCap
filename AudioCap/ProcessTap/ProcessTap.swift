@@ -112,7 +112,7 @@ final class ProcessTap {
             throw errorMessage ?? "Unknown error creating tap."
         }
 
-        logger.debug("Created process/system tap #\(tapID, privacy: .public)")
+        logger.debug("Created process/system tap #\(tapID, privacy: .public). Associated UUID: \(tapDescription.uuid.uuidString)")
         self.processTapID = tapID
 
         let allDeviceIDs = try AudioObjectID.system.getAllHardwareDevices()
@@ -120,7 +120,7 @@ final class ProcessTap {
         var outputDeviceIDs: [AudioDeviceID] = []
         for devID in allDeviceIDs {
             do {
-                let outputChans = try devID.getTotalOutputChannelCount()    
+                let outputChans = try devID.getTotalOutputChannelCount()
                 if outputChans > 0 {
                     let devUID = try devID.readDeviceUID()
                     outputUIDs.append(devUID)
@@ -135,22 +135,50 @@ final class ProcessTap {
             throw "No hardware output devices found!"
         }
 
-        let systemOutputID = try AudioDeviceID.readDefaultSystemOutputDevice()
-        let mainSubdeviceUID = try systemOutputID.readDeviceUID()
+        let systemOutputID: AudioDeviceID
+        do {
+            logger.debug("Attempting to read default system output device ID...")
+            systemOutputID = try AudioDeviceID.readDefaultSystemOutputDevice()
+            logger.debug("Successfully read default system output device ID: \(systemOutputID)")
+        } catch {
+            logger.error("Failed to read default system output device ID: \(error)")
+            throw error // Propagate error
+        }
 
+        let mainSubdeviceUID: String
+        do {
+            logger.debug("Attempting to read device UID for systemOutputID: \(systemOutputID)...")
+            mainSubdeviceUID = try systemOutputID.readDeviceUID()
+            logger.debug("Successfully read mainSubdeviceUID: \(mainSubdeviceUID)")
+        } catch {
+            logger.error("Failed to read device UID for systemOutputID \(systemOutputID): \(error)")
+            throw error // Propagate error
+        }
+        
+        let subDeviceListForAggregate: [[String: Any]]
+        let aggregateDeviceName: String
         let aggregateUID = UUID().uuidString
-        let aggregateDeviceName = processObjectID != nil ? "Tap-\(self.displayName)" : "Tap-SystemOutput"
 
-        let subDeviceList = outputUIDs.map { [kAudioSubDeviceUIDKey: $0] }
+        if processObjectID == nil { // System Audio Mode
+            aggregateDeviceName = "Tap-SysAgg-\(mainSubdeviceUID.prefix(8))"
+            subDeviceListForAggregate = [
+                [kAudioSubDeviceUIDKey: mainSubdeviceUID]
+            ]
+            logger.debug("System mode: mainSubdeviceUID for aggregate: \(mainSubdeviceUID). Aggregate name: \(aggregateDeviceName)")
+        } else { // Specific Process Mode
+            aggregateDeviceName = "Tap-\(self.displayName)-Agg"
+            subDeviceListForAggregate = outputUIDs.map { [kAudioSubDeviceUIDKey: $0] }
+            logger.debug("Process mode: Aggregate subDeviceList from outputUIDs. Aggregate name: \(aggregateDeviceName)")
+        }
 
-        let description: [String: Any] = [
+        let descriptionForAggregate: [String: Any] = [
             kAudioAggregateDeviceNameKey: aggregateDeviceName,
             kAudioAggregateDeviceUIDKey: aggregateUID,
             kAudioAggregateDeviceMainSubDeviceKey: mainSubdeviceUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: subDeviceList,
+            kAudioAggregateDeviceSubDeviceListKey: subDeviceListForAggregate,
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapDriftCompensationKey: true,
@@ -158,16 +186,33 @@ final class ProcessTap {
                 ]
             ]
         ]
-
-        self.tapStreamDescription = try tapID.readAudioTapStreamBasicDescription()
-
+        logger.debug("Aggregate device description prepared. Main sub-device UID: \(mainSubdeviceUID), Tap UUID: \(tapDescription.uuid.uuidString)")
+        
         aggregateDeviceID = AudioObjectID.unknown
-        err = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateDeviceID)
-        guard err == noErr else {
-            throw "Failed to create aggregate device: \(err)"
+        do {
+            logger.debug("Calling AudioHardwareCreateAggregateDevice...")
+            var localErr = AudioHardwareCreateAggregateDevice(descriptionForAggregate as CFDictionary, &aggregateDeviceID)
+            if localErr != noErr {
+                logger.error("AudioHardwareCreateAggregateDevice failed with error: \(localErr).")
+                // Log more details from descriptionForAggregate if helpful
+                // logger.error("Aggregate description details: \(descriptionForAggregate)")
+                throw "Failed to create aggregate device: \(localErr)"
+            }
+            logger.debug("Successfully created aggregate device #\(self.aggregateDeviceID, privacy: .public)")
+        } catch {
+            logger.error("EXCEPTION during AudioHardwareCreateAggregateDevice block: \(error)")
+            throw error // Propagate error
         }
 
-        logger.debug("Created aggregate device #\(self.aggregateDeviceID, privacy: .public)")
+        do {
+            logger.debug("Attempting to read audio tap stream basic description for tapID #\(tapID)...")
+            self.tapStreamDescription = try tapID.readAudioTapStreamBasicDescription()
+            logger.debug("Successfully read tap stream description: \(String(describing: self.tapStreamDescription))")
+        } catch {
+            logger.error("Failed to read audio tap stream basic description for tapID #\(tapID): \(error)")
+            // This is a strong candidate for the "/glob/main" error if tapID is problematic
+            throw error // Propagate error
+        }
     }
 
     func run(on queue: DispatchQueue, ioBlock: @escaping AudioDeviceIOBlock, invalidationHandler: @escaping InvalidationHandler) throws {
@@ -227,7 +272,7 @@ final class ProcessTapRecorder {
     let tapDisplayName: String
     let icon: NSImage
 
-    private(set) var currentAudioLevel: Float = 0.0 
+    private(set) var currentAudioLevel: Float = 0.0
 
     private let queue = DispatchQueue(label: "ProcessTapRecorder", qos: .userInitiated)
     private let logger: Logger
@@ -235,7 +280,7 @@ final class ProcessTapRecorder {
     @ObservationIgnored
     private weak var _tap: ProcessTap?
 
-    private(set) var isRecording = false 
+    private(set) var isRecording = false
 
     init(fileURL: URL, tap: ProcessTap) {
         self.tapDisplayName = tap.displayName
@@ -260,7 +305,7 @@ final class ProcessTapRecorder {
     @ObservationIgnored
     private var currentFile: AVAudioFile?
 
-    @MainActor 
+    @MainActor
     func start() throws {
         logger.debug(#function)
         
@@ -269,7 +314,7 @@ final class ProcessTapRecorder {
             return
         }
 
-        self.isRecording = true 
+        self.isRecording = true
 
         let tap = try tap
 
@@ -277,20 +322,20 @@ final class ProcessTapRecorder {
             tap.activate()
             if let errorMessage = tap.errorMessage {
                 logger.error("Tap activation error: \(errorMessage)")
-                self.isRecording = false 
+                self.isRecording = false
                 throw errorMessage
             }
         }
 
         guard var streamDescription = tap.tapStreamDescription else {
             logger.error("Tap stream description not available.")
-            self.isRecording = false 
+            self.isRecording = false
             throw "Tap stream description not available."
         }
 
         guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
             logger.error("Failed to create AVAudioFormat from stream description.")
-            self.isRecording = false 
+            self.isRecording = false
             throw "Failed to create AVAudioFormat."
         }
 
@@ -308,16 +353,20 @@ final class ProcessTapRecorder {
             self.currentFile = file
         } catch {
             logger.error("Failed to create AVAudioFile for writing: \(error, privacy: .public)")
-            self.isRecording = false 
+            self.isRecording = false
             throw error
         }
 
+        #if DEBUG
+        print("DEBUG: About to call tap.run... (system mode? \(tap.process == nil))")
+        #endif
+
         try tap.run(on: queue) { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
-            guard let self else { return } 
+            guard let self else { return }
             var localAudioLevel: Float = 0.0
             
             do {
-                guard let currentFile = self.currentFile else { 
+                guard let currentFile = self.currentFile else {
                     DispatchQueue.main.async { if self.currentAudioLevel != 0.0 { self.currentAudioLevel = 0.0 } }
                     return
                 }
@@ -337,6 +386,15 @@ final class ProcessTapRecorder {
                         sumOfSquares += sample * sample
                     }
                     rms = sqrt(sumOfSquares / Float(frameLength))
+                    
+                    #if DEBUG
+                    if (try? self.tap.process) == nil {
+                        print("SYSTEM MODE: buffer.frameLength = \(frameLength), RMS = \(rms)")
+                        if rms == 0.0 {
+                            print("SYSTEM MODE: WARNING: Audio buffer is silent (RMS == 0.0)")
+                        }
+                    }
+                    #endif
                 }
                 
                 localAudioLevel = min(max(rms * 2.0, 0.0), 1.0)
@@ -350,7 +408,7 @@ final class ProcessTapRecorder {
             } catch {
                 self.logger.error("Buffer write error: \(error, privacy: .public)")
                 print("ProcessTapRecorder: Buffer write error:", error)
-                localAudioLevel = 0.0 
+                localAudioLevel = 0.0
             }
             
             DispatchQueue.main.async {
@@ -366,13 +424,13 @@ final class ProcessTapRecorder {
         print("ProcessTapRecorder: Recording started (isRecording set to true).")
     }
 
-    @MainActor 
+    @MainActor
     func stop() {
         logger.debug(#function)
         guard isRecording else { return }
         
         self.currentAudioLevel = 0.0
-        self.isRecording = false 
+        self.isRecording = false
 
         guard let tapToInvalidate = try? self.tap else {
             logger.warning("Tap unavailable during stop. Cleaning up recorder state.")
@@ -385,13 +443,13 @@ final class ProcessTapRecorder {
         self.currentFile = nil
     }
 
-    @MainActor 
+    @MainActor
     private func handleInvalidation() {
         logger.debug("Handling tap invalidation in recorder.")
         if isRecording {
             logger.info("Tap invalidated while recording. Stopping recording.")
             self.currentFile = nil
-            self.isRecording = false 
+            self.isRecording = false
             self.currentAudioLevel = 0.0
         }
     }

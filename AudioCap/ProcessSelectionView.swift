@@ -78,6 +78,7 @@ struct ProcessSelectionView: View {
         } else if captureMode == .process && selectedProcess == nil {
             Text("Please select a process to record.")
         }
+
     }
 
     private func setupProcessRecording(for process: AudioProcess) {
