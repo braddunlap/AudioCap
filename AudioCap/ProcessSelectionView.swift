@@ -70,28 +70,31 @@ struct ProcessSelectionView: View {
                     .padding(.top, 2)
             } else if let currentRecorder = recorder {
                 RecordingView(recorder: currentRecorder)
-            } else if captureMode == .system && currentTap.activated {
-                 Text("System audio output tap active. Ready to record.")
+            } else if captureMode == .system && currentTap.activated && recorder == nil {
+                Text("System audio output tap active. Ready to record.")
             }
         } else if captureMode == .system {
             Text("System Audio Output mode selected. Tap will be set up.")
         } else if captureMode == .process && selectedProcess == nil {
             Text("Please select a process to record.")
         }
-
     }
 
     private func setupProcessRecording(for process: AudioProcess) {
         teardownTapAndRecorder()
-        let newTap = ProcessTap(process: process)
+        let target = TapTarget.singleProcess(process)
+        let newTap = ProcessTap(target: target)
         self.tap = newTap
         createProcessRecorder()
         Task {
             do {
-                try recorder?.start()
+                if self.recorder != nil {
+                    try self.recorder?.start()
+                } else {
+                    print("ProcessSelectionView: Recorder was not created for \(process.name), cannot start.")
+                }
             } catch {
                 print("ProcessSelectionView: Failed to start process recording for \(process.name): \(error.localizedDescription)")
-                // Error should be on tap.errorMessage if activation failed
             }
         }
     }
@@ -99,15 +102,23 @@ struct ProcessSelectionView: View {
     private func setupSystemOutputAudioRecording() {
         teardownTapAndRecorder()
         print("ProcessSelectionView: Setting up system audio output recording...")
-        let newTap = ProcessTap(process: nil)
+        let allProcessObjectIDs = processController.processes.map { $0.objectID }
+        if allProcessObjectIDs.isEmpty {
+            print("ProcessSelectionView: No audio processes found for system audio recording. Tap might not capture audio.")
+        }
+        let target = TapTarget.systemAudio(processObjectIDs: allProcessObjectIDs)
+        let newTap = ProcessTap(target: target)
         self.tap = newTap
         createSystemOutputRecorder()
         Task {
             do {
-                try recorder?.start()
+                if self.recorder != nil {
+                    try self.recorder?.start()
+                } else {
+                    print("ProcessSelectionView: Recorder was not created for system audio, cannot start.")
+                }
             } catch {
                 print("ProcessSelectionView: Failed to start system audio output recording: \(error.localizedDescription)")
-                // Error should be on tap.errorMessage if activation failed
             }
         }
     }
@@ -124,15 +135,15 @@ struct ProcessSelectionView: View {
     }
     
     private func createSystemOutputRecorder() {
-       print("ProcessSelectionView: Creating system output recorder...")
-       guard let systemTap = self.tap else {
-           print("CreateSystemOutputRecorder: System tap is nil.")
-           return
-       }
-       let filename = "\(systemTap.displayName)-\(Int(Date.now.timeIntervalSinceReferenceDate))"
-       let audioFileURL = URL.applicationSupport.appendingPathComponent(filename, conformingTo: .wav)
-       let newRecorder = ProcessTapRecorder(fileURL: audioFileURL, tap: systemTap)
-       self.recorder = newRecorder
+        print("ProcessSelectionView: Creating system output recorder...")
+        guard let systemTap = self.tap else {
+            print("CreateSystemOutputRecorder: System tap is nil.")
+            return
+        }
+        let filename = "\(systemTap.displayName)-\(Int(Date.now.timeIntervalSinceReferenceDate))"
+        let audioFileURL = URL.applicationSupport.appendingPathComponent(filename, conformingTo: .wav)
+        let newRecorder = ProcessTapRecorder(fileURL: audioFileURL, tap: systemTap)
+        self.recorder = newRecorder
     }
 
     private func teardownTapAndRecorder() {
