@@ -2,7 +2,10 @@ import SwiftUI
 
 @MainActor
 struct RecordingView: View {
-    let recorder: ProcessTapRecorder
+    // If ProcessTapRecorder is @Observable, this should work fine with @State.
+    // For older iOS/macOS, you might need @ObservedObject if it were an ObservableObject.
+    // With @Observable, @State should re-render on changes to @Published properties.
+    @State var recorder: ProcessTapRecorder 
 
     @State private var lastRecordingURL: URL?
 
@@ -39,7 +42,12 @@ struct RecordingView: View {
             }
         } header: {
             HStack {
-                RecordingIndicator(appIcon: recorder.icon, isRecording: recorder.isRecording)
+                // UPDATE: Pass the live audio level to the indicator
+                RecordingIndicator(
+                    appIcon: recorder.icon,
+                    isRecording: recorder.isRecording,
+                    audioLevel: recorder.currentAudioLevel // Pass the live audio level
+                )
 
                 Text(recorder.isRecording ? "Recording from \(recorder.tapDisplayName)" : "Ready to Record from \(recorder.tapDisplayName)")
                     .font(.headline)

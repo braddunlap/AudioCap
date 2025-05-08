@@ -70,15 +70,6 @@ struct ProcessSelectionView: View {
                     .padding(.top, 2)
             } else if let currentRecorder = recorder {
                 RecordingView(recorder: currentRecorder)
-                    .onChange(of: currentRecorder.isRecording) { wasRecording, isRecording in
-                        if wasRecording, !isRecording {
-                            if captureMode == .process, selectedProcess != nil {
-                                createProcessRecorder() 
-                            } else if captureMode == .system {
-                                createSystemOutputRecorder()
-                            }
-                        }
-                    }
             } else if captureMode == .system && currentTap.activated {
                  Text("System audio output tap active. Ready to record.")
             }
